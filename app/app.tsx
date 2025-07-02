@@ -1,16 +1,18 @@
 "use client"
-
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import AbandonedCartManager from "@/components/abandoned-cart/AbandonedCartManager"
 import ProductsManager from "@/components/products/ProductsManager"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
-import { ShoppingCart, ShoppingBag } from "lucide-react"
+import { ShoppingCart, ShoppingBag, Loader2 } from "lucide-react"
 
 const NAV = [
   { key: "abandoned", label: "Abandoned Carts", icon: <ShoppingCart className="w-5 h-5 mr-2" /> },
   { key: "products", label: "Products", icon: <ShoppingBag className="w-5 h-5 mr-2" /> },
 ]
+
+// Loading Screen Component
+
 
 export default function App() {
   const [tab, setTab] = useState("abandoned")

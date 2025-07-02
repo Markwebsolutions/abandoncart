@@ -1,4 +1,15 @@
+
 "use client"
+
+// Helper to get the latest status from remarks array
+function extractLatestStatusFromRemarks(remarks: any[]) {
+  if (!Array.isArray(remarks)) return 'pending';
+  // Find the latest remark with a status (system or status-change)
+  const statusRemark = [...remarks]
+    .reverse()
+    .find(r => r && r.status && (r.type === 'system' || r.type === 'status-change'));
+  return statusRemark?.status || 'pending';
+}
 
 import { useState, useEffect, useMemo, useCallback } from "react"
 import { Badge } from "@/components/ui/badge"
@@ -44,6 +55,7 @@ import { useTemplateStore } from "@/components/TemplateStore"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 
 export default function AbandonedCartManager() {
+
   const {
     carts,
     setCarts,
@@ -52,6 +64,29 @@ export default function AbandonedCartManager() {
     error: fetchError,
     setError: setFetchError,
   } = useAbandonedCartStore()
+
+  // Track latest status from DB for each cart
+  const [latestStatusByCartId, setLatestStatusByCartId] = useState<{ [cartId: string]: string }>({});
+
+  // Fetch and update latest status for a cart from remarks API
+  const fetchAndSetLatestStatus = useCallback(async (cartId: string) => {
+    try {
+      const res = await fetch(`/api/cart-remarks?cart_id=${encodeURIComponent(cartId)}`);
+      if (!res.ok) return;
+      const { data } = await res.json();
+      const status = extractLatestStatusFromRemarks(data);
+      setLatestStatusByCartId(prev => ({ ...prev, [cartId]: status }));
+    } catch {}
+  }, []);
+
+  // On mount and whenever carts change, fetch latest status for all carts
+  useEffect(() => {
+    if (Array.isArray(carts)) {
+      carts.forEach(cart => {
+        fetchAndSetLatestStatus(cart.id);
+      });
+    }
+  }, [fetchAndSetLatestStatus, carts]);
   const { templates, setTemplates } = useTemplateStore()
   const [expandedCards, setExpandedCards] = useState<string[]>([])
   const [searchTerm, setSearchTerm] = useState("")
@@ -59,6 +94,8 @@ export default function AbandonedCartManager() {
   const [newRemark, setNewRemark] = useState<{ [key: string]: string }>({})
   const [responseType, setResponseType] = useState<{ [key: string]: string }>({})
   const [editingCart, setEditingCart] = useState<string | null>(null)
+  // Track loading state for status update per cart
+  const [statusEditLoading, setStatusEditLoading] = useState<{ [cartId: string]: boolean }>({});
   const [editingResponse, setEditingResponse] = useState<{ cartId: string; remarkId: number } | null>(null)
   const [editResponseText, setEditResponseText] = useState("")
   const [debouncedSearchTerm, setDebouncedSearchTerm] = useState("")
@@ -305,7 +342,7 @@ const [showMetrics, setShowMetrics] = useState(true)
     })
   }, [carts])
 
-  // Filtered carts (search, status, date)
+  // Filtered carts (search, status, date) - status filter uses latestStatusByCartId
   const filteredCarts = useMemo(() => {
     return sortedCarts.filter((cart) => {
       const matchesSearch =
@@ -313,15 +350,17 @@ const [showMetrics, setShowMetrics] = useState(true)
         cart.customer.name.toLowerCase().includes(debouncedSearchTerm.toLowerCase()) ||
         cart.customer.email.toLowerCase().includes(debouncedSearchTerm.toLowerCase()) ||
         cart.customer.phone.toLowerCase().includes(debouncedSearchTerm.toLowerCase()) ||
-        cart.id.toLowerCase().includes(debouncedSearchTerm.toLowerCase())
-      const matchesStatus = statusFilter === "all" || getLatestStatus(cart) === statusFilter
-      const abandonedDate = new Date(cart.abandonedAt)
+        cart.id.toLowerCase().includes(debouncedSearchTerm.toLowerCase());
+      // Use the always-fresh status badge for filtering
+      const latestStatus = latestStatusByCartId[cart.id] || getLatestStatus(cart);
+      const matchesStatus = statusFilter === "all" || latestStatus === statusFilter;
+      const abandonedDate = new Date(cart.abandonedAt);
       const matchesDate =
         (!dateRange.start || abandonedDate >= new Date(dateRange.start)) &&
-        (!dateRange.end || abandonedDate <= new Date(dateRange.end + 'T23:59:59'))
-      return matchesSearch && matchesStatus && matchesDate
-    })
-  }, [sortedCarts, debouncedSearchTerm, statusFilter, dateRange])
+        (!dateRange.end || abandonedDate <= new Date(dateRange.end + 'T23:59:59'));
+      return matchesSearch && matchesStatus && matchesDate;
+    });
+  }, [sortedCarts, debouncedSearchTerm, statusFilter, dateRange, latestStatusByCartId]);
 
   // Metrics
   const metrics = useMemo(() => {
@@ -400,9 +439,6 @@ const [showMetrics, setShowMetrics] = useState(true)
 
   const updateCartField = useCallback(
     async (cartId: string, field: string, value: string) => {
-      // Update the cart in the array and set it using setCarts
-      const updatedCarts = carts.map((cart: Cart) => (cart.id === cartId ? { ...cart, [field]: value } : cart))
-      setCarts(updatedCarts)
       setEditingCart(null)
       try {
         // Always update the main cart record for status/priority/other fields
@@ -412,16 +448,38 @@ const [showMetrics, setShowMetrics] = useState(true)
           body: JSON.stringify({ cart_id: cartId, field, value }),
         })
         if (!res.ok) throw new Error("Failed to update cart field")
+        // Always fetch the latest cart and remarks from the backend after update
+        const cartRes = await fetch(`/api/shopify-abandoned-checkouts?cart_id=${encodeURIComponent(cartId)}`)
+        let latestCart = null
+        if (cartRes.ok) {
+          const data = await cartRes.json()
+          if (data && data.id) {
+            latestCart = data
+          }
+        }
+        // Fetch the latest remarks for this cart
+        let latestRemarks = []
+        try {
+          latestRemarks = await fetchRemarksForCart(cartId)
+        } catch {}
+        // Update the cart in state with both latest cart data and remarks
+        if (latestCart) {
+          setCarts((prevCarts: Cart[]) => prevCarts.map((c: Cart) => c.id === cartId ? { ...c, ...latestCart, remarks: latestRemarks } : c))
+        }
       } catch (e) {
         alert("Failed to update cart field in Supabase")
       }
     },
-    [carts, setCarts],
+    [setCarts, fetchRemarksForCart],
   )
 
   // Add Remark (persist to Supabase)
+  const [activeTab, setActiveTab] = useState<{ [cartId: string]: string }>({})
+  const [lastAddedRemarkId, setLastAddedRemarkId] = useState<number | null>(null)
+  const [addRemarkLoading, setAddRemarkLoading] = useState(false)
   const addRemark = useCallback(async () => {
     if (!remarkForm.type || !remarkForm.message || !remarkForm.cartId) return
+    setAddRemarkLoading(true)
     const remarkData = {
       cart_id: remarkForm.cartId,
       type: remarkForm.type,
@@ -436,34 +494,23 @@ const [showMetrics, setShowMetrics] = useState(true)
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(remarkData),
       })
-      if (!res.ok) throw new Error("Failed to save remark")
+      if (!res.ok) return
       const { data } = await res.json()
-      setCarts(carts.map((cart) => {
-        if (cart.id === remarkForm.cartId) {
-          // If API returns full remarks array, replace; else append
-          if (Array.isArray(data) && data.length > 0 && data.every(r => r && typeof r === 'object' && 'type' in r)) {
-            return {
-              ...cart,
-              remarks: data,
-              lastContacted: new Date().toISOString(),
-            }
-          } else {
-            const prevRemarks = Array.isArray(cart.remarks) ? cart.remarks : []
-            const newRemarks = Array.isArray(data) ? data : [data]
-            return {
-              ...cart,
-              remarks: [...prevRemarks, ...newRemarks],
-              lastContacted: new Date().toISOString(),
-            }
-          }
-        }
-        return cart
-      }))
+      // Fetch latest remarks for this cart
+      const latestRemarks = await fetchRemarksForCart(remarkForm.cartId)
+      setCarts(carts.map((cart) =>
+        cart.id === remarkForm.cartId ? { ...cart, remarks: latestRemarks } : cart
+      ))
+      setExpandedCards((prev) => prev.includes(remarkForm.cartId) ? prev : [...prev, remarkForm.cartId])
+      setActiveTab((prev) => ({ ...prev, [remarkForm.cartId]: 'remarks' }))
       setRemarkForm({ type: "", message: "", cartId: "" })
+      if (data && data.id) setLastAddedRemarkId(data.id)
     } catch (e) {
       alert("Failed to save remark")
+    } finally {
+      setAddRemarkLoading(false)
     }
-  }, [remarkForm, carts, setCarts])
+  }, [remarkForm, carts, setCarts, fetchRemarksForCart])
 
   // Delete Remark
   const deleteRemark = useCallback(async (cartId: string, remarkId: number) => {
@@ -642,6 +689,41 @@ const [showMetrics, setShowMetrics] = useState(true)
   }, [])
 
   const [showInsights, setShowInsights] = useState(true)
+
+  // Fetch last 30 carts from Supabase (fast initial load)
+  const fetchCartsFromSupabase = useCallback(async () => {
+    setIsLoading(true)
+    try {
+      const res = await fetch('/api/recent-carts?limit=15&order=desc')
+      if (!res.ok) throw new Error('Failed to fetch carts from Supabase')
+      const { data } = await res.json()
+      if (Array.isArray(data)) {
+        // Map DB rows to Cart type
+        const allCarts = data.map(mapShopifyCheckoutToCart)
+        // Fetch remarks for all carts
+        for (const cart of allCarts) {
+          cart.remarks = await fetchRemarksForCart(cart.id)
+        }
+        setCarts(allCarts)
+        setTotalCarts(allCarts.length)
+        setFetchError(null)
+      } else {
+        setCarts([])
+        setFetchError('No carts found in Supabase')
+      }
+    } catch (error) {
+      setCarts([])
+      setFetchError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setIsLoading(false)
+    }
+  }, [setCarts, setIsLoading, setFetchError, fetchRemarksForCart])
+
+  // On mount: fetch last 30 carts from Supabase
+  useEffect(() => {
+    fetchCartsFromSupabase()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   return (
     <div className="min-h-screen bg-gray-50 p-3">
@@ -986,53 +1068,106 @@ const [showMetrics, setShowMetrics] = useState(true)
                         <div className="space-y-1">
                           <div className="flex items-center space-x-2 relative">
                             <h3 className="font-semibold text-lg">{cart.customer.name}</h3>
-                            {/* Status badge beside name */}
-                            <Badge
-                              className={`${statusColors[getLatestStatus(cart) as keyof typeof statusColors]} cursor-pointer`}
-                              onClick={() => setEditingCart(editingCart === `${cart.id}-status` ? null : `${cart.id}-status`)}
-                            >
-                              {getStatusIcon(getLatestStatus(cart))}
-                              <span className="ml-1">
-                                {getLatestStatus(cart) === "completed"
-                                  ? "converted"
-                                  : getLatestStatus(cart) === "failed"
-                                    ? "lost"
-                                    : getLatestStatus(cart)}
-                              </span>
-                              <Edit3 className="w-3 h-3 ml-1" />
-                            </Badge>
+                            {/* Combined status box */}
+                            <div className="flex items-center bg-gray-100 border border-gray-300 rounded-lg px-2 py-1 shadow-sm gap-2 min-w-[180px]">
+                              {/* Editable status badge */}
+                              <Badge
+                                className={`${statusColors[getLatestStatus(cart) as keyof typeof statusColors]} cursor-pointer`}
+                                onClick={() => setEditingCart(editingCart === `${cart.id}-status` ? null : `${cart.id}-status`)}
+                              >
+                                {/* Loader or icon for status badge */}
+                                {statusEditLoading?.[cart.id] ? (
+                                  <span className="flex items-center">
+                                    <span className="animate-spin rounded-full h-4 w-4 border-t-2 border-b-2 border-blue-500 mr-1"></span>
+                                    <span className="text-xs text-blue-500"></span>
+                                  </span>
+                                ) : (
+                                  <Edit3 className="w-3 h-3 ml-1" />
+                                )}
+                              </Badge>
+                              {/* Always-fresh status badge from DB (read-only) */}
+                              <Badge
+                                className={`ml-1 ${statusColors[latestStatusByCartId[cart.id] as keyof typeof statusColors] || ''}`}
+                                title="Latest status from database"
+                              >
+
+
+                                {getStatusIcon(latestStatusByCartId[cart.id] || 'pending')}
+                                <span className="ml-1">
+                                  {latestStatusByCartId[cart.id] === "completed"
+                                    ? "converted"
+                                    : latestStatusByCartId[cart.id] === "failed"
+                                      ? "lost"
+                                      : latestStatusByCartId[cart.id] || 'pending'}
+                                </span>
+                                
+                              </Badge>
+                            </div>
                             {editingCart === `${cart.id}-status` && (
                               <div className="absolute left-1/2 -translate-x-1/2 top-full mt-1 bg-white border rounded-lg shadow-lg p-2 z-50 min-w-[120px]">
                                 <div className="space-y-1">
-                                  {[
-                                    { value: "pending", label: "pending" },
-                                    { value: "in-progress", label: "in-progress" },
-                                    { value: "completed", label: "converted" },
-                                    { value: "failed", label: "lost" },
+                                  {statusEditLoading[cart.id] ? (
+                                    <div className="flex items-center justify-center py-2">
+                                      <div className="animate-spin rounded-full h-5 w-5 border-t-2 border-b-2 border-blue-500 mr-2"></div>
+                                      <span className="text-xs text-blue-500">Updating...</span>
+                                    </div>
+                                  ) : ([
+                                    { value: "pending", label: "Pending" },
+                                    { value: "in-progress", label: "In-Progress" },
+                                    { value: "completed", label: "Converted" },
+                                    { value: "failed", label: "Lost" },
                                   ].map((status) => (
                                     <button
                                       key={status.value}
                                       className="block w-full text-left px-2 py-1 hover:bg-gray-100 rounded text-sm"
                                       onClick={async () => {
+                                        setStatusEditLoading(prev => ({ ...prev, [cart.id]: true }));
+                                        // 1. Update status in DB
                                         await updateCartField(cart.id, "status", status.value)
-                                        // Fetch the latest cart from the backend and update local state
+                                        // 4. Fetch and update the latest status badge from DB
+                                        await fetchAndSetLatestStatus(cart.id);
+                                        // 2. Add a remark for the status change
                                         try {
-                                          const res = await fetch(`/api/shopify-abandoned-checkouts?cart_id=${encodeURIComponent(cart.id)}`)
-                                          if (res.ok) {
-                                            const data = await res.json()
+                                          const remarkData = {
+                                            cart_id: cart.id,
+                                            type: "status-change",
+                                            message: `Status changed to ${status.label}`,
+                                            response: null,
+                                            agent: "Current User",
+                                            status: status.value,
+                                          };
+                                          await fetch("/api/cart-remarks", {
+                                            method: "POST",
+                                            headers: { "Content-Type": "application/json" },
+                                            body: JSON.stringify(remarkData),
+                                          });
+                                        } catch {}
+                                        // 3. Always fetch latest cart and remarks after status change
+                                        try {
+                                          const cartRes = await fetch(`/api/shopify-abandoned-checkouts?cart_id=${encodeURIComponent(cart.id)}`)
+                                          let latestCart = null
+                                          if (cartRes.ok) {
+                                            const data = await cartRes.json()
                                             if (data && data.id) {
-                                              setCarts(carts.map((c) => c.id === cart.id ? { ...c, ...data } : c))
+                                              latestCart = data
                                             }
                                           }
-                                        } catch (e) {
-                                          // Optionally show error
-                                        }
+                                          let latestRemarks = [];
+                                          try {
+                                            latestRemarks = await fetchRemarksForCart(cart.id);
+                                          } catch {}
+                                          if (latestCart) {
+                                            setCarts((prevCarts: Cart[]) => prevCarts.map((c: Cart) => c.id === cart.id ? { ...c, ...latestCart, remarks: latestRemarks } : c))
+                                          }
+                                        } catch {}
+                                        setStatusEditLoading(prev => ({ ...prev, [cart.id]: false }));
                                         setEditingCart(null)
                                       }}
                                     >
                                       {status.label}
                                     </button>
-                                  ))}
+                                  )))
+                                  }
                                 </div>
                               </div>
                             )}
@@ -1148,12 +1283,12 @@ const [showMetrics, setShowMetrics] = useState(true)
                             </div>
                           </PopoverContent>
                         </Popover>
-                        {/* ...other quick actions... */}
+                        {/* Quick action buttons for SMS, Call, Email */}
                         <Button size="sm" variant="outline" onClick={() => window.open(`sms:${cart.customer.phone}`)}>
                           <MessageSquare className="w-4 h-4 mr-1" /> SMS
                         </Button>
                         <Button size="sm" variant="outline" onClick={() => window.open(`tel:${cart.customer.phone}`)}>
-                          <Phone className="w-4 h-4 mr-1" /> Call
+                          <Phone className="w-4 h-4 mr-1" /> Phone
                         </Button>
                         <Button size="sm" variant="outline" onClick={() => window.open(`mailto:${cart.customer.email}`)}>
                           <Mail className="w-4 h-4 mr-1" /> Email
@@ -1188,6 +1323,7 @@ const [showMetrics, setShowMetrics] = useState(true)
                                   </SelectTrigger>
                                   <SelectContent>
                                     <SelectItem value="email">Email</SelectItem>
+                                    <SelectItem value="phone">Phone</SelectItem>
                                     <SelectItem value="sms">SMS</SelectItem>
                                     <SelectItem value="whatsapp">WhatsApp</SelectItem>
                                   </SelectContent>
@@ -1206,9 +1342,13 @@ const [showMetrics, setShowMetrics] = useState(true)
                                   await addRemark()
                                   setRemarkForm({ type: "", message: "", cartId: "" })
                                 }}
-                                disabled={!remarkForm.type || !remarkForm.message}
+                                disabled={!remarkForm.type || !remarkForm.message || addRemarkLoading}
                               >
-                                Add Remark
+                                {addRemarkLoading ? (
+                                  <span className="flex items-center"><svg className="animate-spin h-4 w-4 mr-2 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path></svg>Adding...</span>
+                                ) : (
+                                  "Add Remark"
+                                )}
                               </Button>
                             </div>
                           </DialogContent>
@@ -1220,95 +1360,121 @@ const [showMetrics, setShowMetrics] = useState(true)
                     </div>
 
                     {isExpanded && (
-                      <Tabs defaultValue="remarks" className="w-full">
+                      <Tabs value={activeTab[cart.id] || 'remarks'} onValueChange={v => setActiveTab(a => ({ ...a, [cart.id]: v }))} className="w-full">
                         <TabsList className="grid w-full grid-cols-3">
                           <TabsTrigger value="remarks">Remarks</TabsTrigger>
                           <TabsTrigger value="items">Items</TabsTrigger>
                           <TabsTrigger value="customer">Customer</TabsTrigger>
                         </TabsList>
 
-                        <TabsContent value="remarks" className="mt-4">
-                          <div className="space-y-4">
-                            {/* Defensive: Only render remarks that are not null/undefined */}
-                            {Array.isArray(cart.remarks) ?
-                              cart.remarks
-                                .filter(
-                                  (remark) =>
-                                    remark &&
-                                    typeof remark === 'object' &&
-                                    'type' in remark &&
-                                    typeof remark.type === 'string'
-                                )
-                                .map((remark) => (
-                                  <div key={remark.id} className="border-l-4 border-blue-500 pl-4 py-3 bg-white rounded-r-lg">
-                                    <div className="flex items-center justify-between mb-2">
-                                      <div className="flex items-center space-x-2">
-                                        {/* ...existing icons... */}
-                                        {remark.type === "email" && <Mail className="w-4 h-4" />}
-                                        {remark.type === "sms" && <MessageSquare className="w-4 h-4" />}
-                                        {remark.type === "phone" && <Phone className="w-4 h-4" />}
-                                        {remark.type === "whatsapp" && <MessageSquare className="w-4 h-4 text-green-600" />}
-                                        {remark.type === "response" && <User className="w-4 h-4" />}
-                                        <span className="font-medium capitalize">{remark.type}</span>
-                                      </div>
-                                      <span className="text-sm text-gray-500">
-                                        {remark.date && !isNaN(new Date(remark.date).getTime())
-    ? formatDate(remark.date)
-    : "N/A"}
-                                        {remark.agent ? ` - ${remark.agent}` : ""}
-                                      </span>
-                                    </div>
-                                    <p className="text-sm mb-2">{remark.message}</p>
-                                    {remark.response && (
-                                      <div className="bg-emerald-50 p-3 rounded border-l-4 border-emerald-500">
-                                        <div className="flex items-center justify-between mb-1">
-                                          <p className="text-sm font-medium text-emerald-800">Customer Response:</p>
-                                          <Button
-                                            size="sm"
-                                            variant="ghost"
-                                            onClick={() => setEditingResponse({ cartId: cart.id, remarkId: remark.id })}
-                                          >
-                                            <Edit className="w-3 h-3" />
-                                          </Button>
-                                        </div>
-                                        {editingResponse?.cartId === cart.id && editingResponse?.remarkId === remark.id ? (
-                                          <div className="space-y-2">
-                                            <Textarea
-                                              value={editResponseText}
-                                              onChange={(e) => setEditResponseText(e.target.value)}
-                                              className="text-sm border-emerald-300 focus:border-emerald-500"
-                                            />
-                                            <div className="flex space-x-2">
-                                              <Button
-                                                size="sm"
-                                                onClick={saveEditedResponse}
-                                                className="bg-emerald-600 hover:bg-emerald-700 text-white"
-                                              >
-                                                Save
-                                              </Button>
-                                              <Button size="sm" variant="outline" onClick={() => setEditingResponse(null)}>
-                                                Cancel
-                                              </Button>
-                                            </div>
-                                          </div>
-                                        ) : (
-                                          <p className="text-sm text-emerald-700 font-medium">{remark.response}</p>
-                                        )}
-                                      </div>
-                                    )}
-                                    {/* Delete button for each remark */}
-                                    <button
-                                      className="text-xs text-red-500 hover:underline ml-2"
-                                      title="Delete remark"
-                                      onClick={() => deleteRemark(cart.id, remark.id)}
-                                    >
-                                      Delete
-                                    </button>
-                                  </div>
-                                ))
-                              : null}
-                          </div>
-                        </TabsContent>
+<TabsContent value="remarks" className="mt-4">
+  <div className="space-y-4">
+    {Array.isArray(cart.remarks)
+      ? cart.remarks
+          .filter(
+            (remark) =>
+              remark &&
+              typeof remark === "object" &&
+              "type" in remark &&
+              typeof remark.type === "string"
+          )
+          .map((remark) => (
+            <div
+              key={remark.id}
+              className="border-l-4 border-blue-500 pl-4 py-3 bg-white rounded-r-lg"
+            >
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center space-x-2">
+                  {remark.type === "email" && <Mail className="w-4 h-4" />}
+                  {remark.type === "sms" && <MessageSquare className="w-4 h-4" />}
+                  {remark.type === "phone" && <Phone className="w-4 h-4" />}
+                  {remark.type === "whatsapp" && (
+                    <MessageSquare className="w-4 h-4 text-green-600" />
+                  )}
+                  {remark.type === "response" && <User className="w-4 h-4" />}
+                  <span className="font-medium capitalize">{remark.type}</span>
+                  {lastAddedRemarkId === remark.id && (
+                    <span className="ml-2 px-2 py-0.5 bg-green-100 text-green-700 text-xs rounded font-semibold animate-pulse">
+                      New Remark
+                    </span>
+                  )}
+                </div>
+                <span className="text-sm text-gray-500">
+                  {remark.date && !isNaN(new Date(remark.date).getTime())
+                    ? formatDate(remark.date)
+                    : "N/A"}
+                  {remark.agent ? ` - ${remark.agent}` : ""}
+                </span>
+              </div>
+
+              <p className="text-sm mb-2">{remark.message}</p>
+
+              {remark.response && (
+                <div className="bg-emerald-50 p-3 rounded border-l-4 border-emerald-500">
+                  <div className="flex items-center justify-between mb-1">
+                    <p className="text-sm font-medium text-emerald-800">
+                      Customer Response:
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() =>
+                        setEditingResponse({
+                          cartId: cart.id,
+                          remarkId: remark.id,
+                        })
+                      }
+                    >
+                      <Edit className="w-3 h-3" />
+                    </Button>
+                  </div>
+
+                  {editingResponse?.cartId === cart.id &&
+                  editingResponse?.remarkId === remark.id ? (
+                    <div className="space-y-2">
+                      <Textarea
+                        value={editResponseText}
+                        onChange={(e) => setEditResponseText(e.target.value)}
+                        className="text-sm border-emerald-300 focus:border-emerald-500"
+                      />
+                      <div className="flex space-x-2">
+                        <Button
+                          size="sm"
+                          onClick={saveEditedResponse}
+                          className="bg-emerald-600 hover:bg-emerald-700 text-white"
+                        >
+                          Save
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => setEditingResponse(null)}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-emerald-700 font-medium">
+                      {remark.response}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              <button
+                className="text-xs text-red-500 hover:underline ml-2"
+                title="Delete remark"
+                onClick={() => deleteRemark(cart.id, remark.id)}
+              >
+                Delete
+              </button>
+            </div>
+          ))
+      : null}
+  </div>
+</TabsContent>
+
 
                         <TabsContent value="items" className="mt-4">
                           <div className="space-y-3">
@@ -1361,7 +1527,7 @@ const [showMetrics, setShowMetrics] = useState(true)
             })
           ) : (
             <Card className="text-center p-8">
-              <p className="text-gray-500">No carts found</p>
+              <p className="text-gray-500"></p>
               {filteredCarts.length === 0 && carts.length > 0 && (
                 <p className="text-sm text-gray-400 mt-2">Try adjusting your filters</p>
               )}

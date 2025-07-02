@@ -266,7 +266,7 @@ const CartCard = memo(function CartCard({
                         <span className="font-medium capitalize">{remark.type}</span>
                       </div>
                       <span className="text-sm text-gray-500">
-                        {formatDate(remark.date)} - {remark.agent}
+                        {formatDate(remark.date ?? "")} - {remark.agent}
                       </span>
                     </div>
                     <p className="text-sm mb-2">{remark.message}</p>

@@ -1,0 +1,7 @@
+build me a ui page (react-tsx) which i will add as a component to my existing react app ; a leads page in which a user will note the leads for a company coming from different sources 
+
+
+
+build me a ui frontend page  Next.js (React, App Router) TypeScript which i will add as a component to my existing react app - a product display page that will display the products from the shopify (through api) i will build the express server file bymyself  Next.js API routes (e.g., /api/shopify-abandoned-checkouts) only build the frontend component with various features and sensible insights on top 
+
+fetch onlylast 3 days data and only on request(throght filter option) fetch requested data from shopify this will prevent unnecessary api calls and keep the app light weight also remove (previous 3 days and nect 3 days button as there is no need for that) 

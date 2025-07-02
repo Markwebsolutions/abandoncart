@@ -20,22 +20,50 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
-    // Shopify REST Admin API endpoint for products
-    const apiUrl = `${shopUrl}/admin/api/2025-04/products.json?limit=250`;
-    const shopifyRes = await fetch(apiUrl, {
-      headers: {
-        'X-Shopify-Access-Token': accessToken,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      },
-    });
-    if (!shopifyRes.ok) {
-      const text = await shopifyRes.text();
-      return res.status(shopifyRes.status).json({ error: text, apiUrl });
+    // Fetch all products using pagination (Shopify REST API: limit 250 per page)
+    let products: any[] = [];
+    let pageInfo: string | null = null;
+    let page = 1;
+    let hasNextPage = true;
+    let lastApiUrl = '';
+    while (hasNextPage) {
+      let apiUrl = `${shopUrl}/admin/api/2025-04/products.json?limit=250`;
+      if (pageInfo) {
+        apiUrl += `&page_info=${encodeURIComponent(pageInfo)}`;
+      }
+      lastApiUrl = apiUrl;
+      const shopifyRes = await fetch(apiUrl, {
+        headers: {
+          'X-Shopify-Access-Token': accessToken,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+      });
+      if (!shopifyRes.ok) {
+        const text = await shopifyRes.text();
+        return res.status(shopifyRes.status).json({ error: text, apiUrl });
+      }
+      const data = await shopifyRes.json();
+      if (Array.isArray(data.products)) {
+        products = products.concat(data.products);
+      }
+      // Check for pagination using the Link header
+      const linkHeader = shopifyRes.headers.get('link') || shopifyRes.headers.get('Link');
+      if (linkHeader && linkHeader.includes('rel="next"')) {
+        // Extract page_info from the next link
+        const match = linkHeader.match(/<[^>]+page_info=([^&>]+)[^>]*>; rel="next"/);
+        if (match && match[1]) {
+          pageInfo = match[1];
+          hasNextPage = true;
+        } else {
+          hasNextPage = false;
+        }
+      } else {
+        hasNextPage = false;
+      }
+      page++;
     }
-    const data = await shopifyRes.json();
-    // Return as { products: [...] }
-    return res.status(200).json({ products: data.products || [], apiUrl });
+    return res.status(200).json({ products, apiUrl: lastApiUrl });
   } catch (error: any) {
     return res.status(500).json({ error: error.message || 'Failed to fetch products from Shopify', stack: error.stack });
   }
